@@ -15,7 +15,13 @@ from uuid import uuid4
 
 from .annotations import Context
 from .context import StreamId
-from .events import BaseEvent, ModelRequest, ModelResponse, ToolResultsEvent
+from .events import (
+    BaseEvent,
+    ModelRequest,
+    ModelResponse,
+    ToolCallsEvent,
+    ToolResultsEvent,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +54,7 @@ class L2MemoryBlock:
     """Level-2 long-term memory block.
 
     Created by asynchronously consolidating one or more L1 blocks into a
-    single highly-condensed representation that persists across sessions.
+    single consolidated representation that persists across sessions.
     """
 
     id: str
@@ -162,16 +168,33 @@ def parse_l2_operation(d: dict) -> L2Operation:
 # Default prompts for the built-in summarizer and consolidator
 # ---------------------------------------------------------------------------
 
+# Soft upper bound (word count) communicated to the default LLM prompts for L1/L2 abstracts.
+_DEFAULT_MEMORY_ABSTRACT_MAX_WORDS = 1000
+
 _DEFAULT_SUMMARIZER_SYSTEM = (
-    "You are a concise summariser. Reply with only the summary, no preamble."
+    "You are a summariser for a memory index. Reply with only the summary, no preamble. "
+    "The summary becomes each block’s abstract (shown in the pinned memory header); the agent "
+    "chooses which blocks to load from it. You may write one paragraph or several; stay within "
+    f"{_DEFAULT_MEMORY_ABSTRACT_MAX_WORDS} words total. Keep concrete specifics that distinguish "
+    "this segment from others."
 )
 _DEFAULT_SUMMARIZER_USER = (
-    "Summarise the following conversation in 1-3 sentences:\n\n{text}"
+    "Summarise the following. You may use one paragraph or several; keep the total under "
+    "{max_words} words. Preserve retrieval-critical specifics from the "
+    "source whenever they appear: people’s names and roles; organisation, product, and place "
+    "names; dates, times, time zones, and deadlines; numbers, versions, IDs, URLs, and file "
+    "paths; explicit decisions, outcomes, and open questions. Prefer named entities over vague "
+    "phrases like “the user” or “a meeting” when a proper noun or time is known. Do not strip "
+    "information the agent would need to decide whether to call memory_lookup for this block.\n\n"
+    "{text}"
 )
 
 _DEFAULT_CONSOLIDATOR_SYSTEM = (
-    "You are a long-term memory manager for an AI assistant. "
-    "Return only valid JSON with no markdown fences."
+    "You are a long-term memory manager for an AI assistant. Each block’s abstract is the primary "
+    "hint the agent sees before retrieving full text; abstracts must stay specific enough "
+    "(names, places, times, key facts) to support accurate lookup decisions. "
+    "An abstract may be several paragraphs (still within the word limit given in the user "
+    "message). Return only valid JSON with no markdown fences."
 )
 _DEFAULT_CONSOLIDATOR_USER = """\
 You manage long-term memory for an AI assistant.
@@ -192,6 +215,8 @@ Rules:
   - Only mention blocks that actually change; unchanged blocks are omitted.
   - new_l1_ids must be IDs drawn from the new short-term blocks listed above.
   - Keep total blocks <= {max_blocks}.
+  - Each "abstract" (create or update) may be up to {max_abstract_words} words—one paragraph or several. Prefer enough detail for retrieval over extreme brevity. For paragraph breaks inside JSON string values, use \\n escapes.
+  - Every "abstract" you output (create or update) is a retrieval index: carry forward concrete details from the relevant L1 abstracts—people’s names and roles; organisation, product, and place names; dates, times, time zones, and deadlines; numbers, versions, IDs, URLs, and file paths; decisions, outcomes, and open questions. Merge related L1 material without collapsing into vague prose; if two topics differ by who/when/where, keep those distinctions visible.
 
 Return ONLY a JSON array of operations, for example:
 [
@@ -207,7 +232,12 @@ def _build_default_summarizer(config: Any) -> "Summarizer":
     async def _summarizer(text: str) -> str:
         from .agent import Agent  # local import to avoid circular dependency
         agent = Agent("summariser", prompt=_DEFAULT_SUMMARIZER_SYSTEM, config=config)
-        reply = await agent.ask(_DEFAULT_SUMMARIZER_USER.format(text=text))
+        reply = await agent.ask(
+            _DEFAULT_SUMMARIZER_USER.format(
+                max_words=_DEFAULT_MEMORY_ABSTRACT_MAX_WORDS,
+                text=text,
+            )
+        )
         return (await reply.content()) or ""
     return _summarizer
 
@@ -283,6 +313,7 @@ def _build_default_consolidator(config: Any) -> "Consolidator":
         )
         prompt = _DEFAULT_CONSOLIDATOR_USER.format(
             max_blocks=max_blocks,
+            max_abstract_words=_DEFAULT_MEMORY_ABSTRACT_MAX_WORDS,
             existing_text=existing_text,
             new_l1_text=new_l1_text,
         )
@@ -323,8 +354,15 @@ class LongShortTermMemoryStorage:
 
     **L1 short-term memory** — compressed within a session.
     Triggered lazily inside ``get_history`` whenever the raw-event token
-    budget exceeds *token_threshold*.  L1 blocks exist only for the lifetime
-    of the current Python process.
+    budget exceeds *token_threshold* (by default, ``memory_lookup`` tool
+    lines are excluded from that measurement and from L1 ``source_text``).
+    On each **lazy** compression, ``memory_lookup`` call/result *events* are
+    also dropped from raw history for everything **before** the last
+    *recent_turns* user messages; the recent suffix is left intact so the
+    model still sees fresh lookups. At **session end**, ``consolidate()``
+    flushes **all** remaining raw into a **single** L1 block (again stripping
+    ``memory_lookup`` tool events from that summary). L1 blocks exist only for
+    the lifetime of the current Python process.
 
     **L2 long-term memory** — persisted across sessions to a JSON file.
     L2 consolidation is *not* triggered automatically during the session;
@@ -393,6 +431,7 @@ class LongShortTermMemoryStorage:
         token_threshold: int = 10_000,
         max_l2_blocks: int = 20,
         recent_turns: int = 5,
+        l1_ignore_tool_names: frozenset[str] | None = None,
     ) -> None:
         """
         Parameters
@@ -438,6 +477,13 @@ class LongShortTermMemoryStorage:
         recent_turns:
             Number of most-recent user/assistant turn pairs kept as raw events
             in the active context window; older turns are compressed into L1.
+        l1_ignore_tool_names:
+            Tool names whose call and result lines are omitted when measuring
+            raw context size for L1 compression and when building L1
+            ``source_text`` / summariser input (so large ``memory_lookup``
+            payloads do not spuriously trigger compression or get re-summarised
+            into a new L1 block).  ``None`` defaults to ``frozenset({"memory_lookup"})``.
+            Pass ``frozenset()`` to disable filtering.
         """
         if summarizer is None and config is None:
             raise ValueError(
@@ -466,6 +512,11 @@ class LongShortTermMemoryStorage:
         self._token_threshold = token_threshold
         self._max_l2_blocks = max_l2_blocks
         self._recent_turns = recent_turns
+        self._l1_ignore_tool_names: frozenset[str] = (
+            frozenset(l1_ignore_tool_names)
+            if l1_ignore_tool_names is not None
+            else frozenset({"memory_lookup"})
+        )
 
         # per-stream raw event store (only recent, un-compressed events)
         self._raw_events: defaultdict[StreamId, list[BaseEvent]] = defaultdict(list)
@@ -549,8 +600,8 @@ class LongShortTermMemoryStorage:
         is called automatically.
 
         Order of operations:
-        1. ``_flush_remaining_to_l1`` — force-compress any raw events that
-           never exceeded the token threshold into a final L1 block.
+        1. ``_flush_remaining_to_l1`` — force **all** remaining raw events
+           into one final L1 block (``memory_lookup`` tool traffic excluded).
         2. L2 consolidation — the consolidator updates/creates/deletes L2
            blocks based on the pending L1 blocks.  If this step fails the
            pending blocks are restored and nothing is saved.
@@ -561,8 +612,7 @@ class LongShortTermMemoryStorage:
 
         If there are no pending L1 blocks the method is a no-op.
         """
-        # Ensure the tail of the conversation (below the token threshold) is
-        # captured in L1 before we attempt consolidation.
+        # Capture every remaining raw event in one L1 block before L2 merge.
         await self._flush_remaining_to_l1()
 
         if not self._pending_l1_for_l2:
@@ -710,7 +760,7 @@ class LongShortTermMemoryStorage:
 
         **L2 blocks (long-term memory)**
           Created at the end of a session by consolidating one or more L1
-          blocks into a single highly-condensed entry that persists across
+          blocks into a single consolidated entry that persists across
           sessions.  Each L2 block stores an *abstract* and the list of L1
           block IDs it was built from.
           IDs look like ``"L2-b7e91d04"``.
@@ -789,18 +839,32 @@ class LongShortTermMemoryStorage:
     # ------------------------------------------------------------------
 
     async def _flush_remaining_to_l1(self) -> None:
-        """Force-compress every stream's remaining raw events into an L1 block.
+        """Force-compress **all** of each stream's remaining raw events into one L1 block.
 
-        Called at the start of ``consolidate()`` so that the tail of the
-        conversation — turns that never exceeded the token threshold and were
-        therefore not compressed lazily — is still captured in L1 and
-        eventually consolidated into L2 long-term memory.
+        Called at the start of ``consolidate()`` so nothing is left only in the
+        raw buffer when L2 runs.  Unlike lazy L1, this does **not** honour
+        *recent_turns*: the entire tail becomes a single block.
+
+        ``memory_lookup`` tool call/result events are pruned from the event
+        list first, and transcript lines for ignored tools are still omitted via
+        ``_events_to_text``, so bulky retrievals are not embedded in L1
+        ``source_text``.
         """
         for stream_id, raw in list(self._raw_events.items()):
             if not raw:
                 continue
-            source_text = _events_to_text(raw)
+            pruned: list[BaseEvent] = []
+            for ev in raw:
+                p = _prune_l1_ignored_tools_from_event(
+                    ev,
+                    ignore_tool_names=self._l1_ignore_tool_names,
+                )
+                if p is not None:
+                    pruned.append(p)
+
+            source_text = _events_to_text(pruned, ignore_tool_names=self._l1_ignore_tool_names)
             if not source_text.strip():
+                self._raw_events[stream_id] = []
                 continue
             try:
                 abstract = await self._summarizer(source_text)
@@ -814,30 +878,41 @@ class LongShortTermMemoryStorage:
             block_id = f"L1-{uuid4().hex[:8]}"
             l1_block = L1MemoryBlock(id=block_id, abstract=abstract, source_text=source_text)
             self._l1_blocks[stream_id].append(l1_block)
-            self._raw_events[stream_id] = []
             self._pending_l1_for_l2.append(l1_block)
+            self._raw_events[stream_id] = []
 
     async def _maybe_compress_to_l1(self, stream_id: "StreamId") -> None:
         """Compress the oldest conversation turns into an L1 block when the
         raw-event token budget is exceeded."""
-        raw = self._raw_events[stream_id]
-        if not raw:
+        raw_list = list(self._raw_events[stream_id])
+        if not raw_list:
             return
 
-        total_text = _events_to_text(raw)
+        total_text = _events_to_text(raw_list, ignore_tool_names=self._l1_ignore_tool_names)
         if self._token_counter(total_text) <= self._token_threshold:
             return
 
-        turn_starts = [i for i, e in enumerate(raw) if isinstance(e, ModelRequest)]
+        turn_starts = [i for i, e in enumerate(raw_list) if isinstance(e, ModelRequest)]
         if len(turn_starts) <= self._recent_turns:
             return  # cannot compress without losing all recent context
 
-        cutoff = turn_starts[-self._recent_turns]
-        to_compress = raw[:cutoff]
+        protected = turn_starts[-self._recent_turns]
+        raw_list, cutoff = _prune_l1_ignored_tools_from_head_and_rejoin(
+            raw_list,
+            protected,
+            ignore_tool_names=self._l1_ignore_tool_names,
+        )
+        self._raw_events[stream_id] = raw_list
+
+        total_text = _events_to_text(raw_list, ignore_tool_names=self._l1_ignore_tool_names)
+        if self._token_counter(total_text) <= self._token_threshold:
+            return
+
+        to_compress = raw_list[:cutoff]
         if not to_compress:
             return
 
-        source_text = _events_to_text(to_compress)
+        source_text = _events_to_text(to_compress, ignore_tool_names=self._l1_ignore_tool_names)
         try:
             abstract = await self._summarizer(source_text)
         except Exception:
@@ -848,7 +923,7 @@ class LongShortTermMemoryStorage:
         l1_block = L1MemoryBlock(id=block_id, abstract=abstract, source_text=source_text)
 
         self._l1_blocks[stream_id].append(l1_block)
-        self._raw_events[stream_id] = raw[cutoff:]
+        self._raw_events[stream_id] = raw_list[cutoff:]
 
         # Accumulate for end-of-session L2 consolidation
         self._pending_l1_for_l2.append(l1_block)
@@ -875,14 +950,14 @@ class LongShortTermMemoryStorage:
             "                  scrolled out of the active context window. Each L1 block covers",
             "                  a batch of turns from the current or most recent session.",
             "",
-            "  L2 Long-Term  — Highly condensed cross-session consolidations built from one or",
-            "                  more L1 blocks. These persist across conversations and represent",
-            "                  older, broader history.",
+            "  L2 Long-Term  — Cross-session consolidations built from one or more L1 blocks.",
+            "                  They persist across conversations and represent older, broader history.",
             "",
-            "Each L1/L2 entry below shows: [id] (created <timestamp>) <one-line abstract>",
-            "The abstract is a brief summary only. Call memory_lookup(block_id) to retrieve",
-            "the full source text of any block whose abstract looks relevant to the current",
-            "request. Do NOT infer details beyond what the abstract states without looking up",
+            "Each L1/L2 entry below shows: [id] (created <timestamp>) <abstract>",
+            f"Each abstract is a retrieval-oriented summary (one or more paragraphs; at most about "
+            f"{_DEFAULT_MEMORY_ABSTRACT_MAX_WORDS} words). Call memory_lookup(block_id) to retrieve",
+            "the full source text of any block whose abstract looks necessary to the current",
+            "request. You can retrieve many times to get enough information. Do NOT infer details beyond what the abstract states without looking up",
             "the block first.",
         ]
 
@@ -1006,13 +1081,94 @@ class LongShortTermMemoryStorage:
 # ---------------------------------------------------------------------------
 
 
+def _prune_l1_ignored_tools_from_event(
+    event: BaseEvent,
+    *,
+    ignore_tool_names: frozenset[str],
+) -> BaseEvent | None:
+    """Drop or trim *event* so that ignored tool calls/results are removed.
+
+    Returns ``None`` if the event carries no remaining visible content.
+    """
+    if isinstance(event, ModelResponse):
+        calls = event.tool_calls.calls if event.tool_calls else []
+        kept_calls = [c for c in calls if c.name not in ignore_tool_names]
+        if event.message or kept_calls:
+            if len(kept_calls) == len(calls):
+                return event
+            new_tc = ToolCallsEvent(calls=kept_calls) if kept_calls else ToolCallsEvent()
+            return ModelResponse(
+                message=event.message,
+                tool_calls=new_tc,
+                usage=dict(event.usage),
+                response_force=event.response_force,
+                model=event.model,
+                provider=event.provider,
+                finish_reason=event.finish_reason,
+                images=list(event.images),
+            )
+        return None
+
+    if isinstance(event, ToolCallsEvent):
+        kept = [c for c in event.calls if c.name not in ignore_tool_names]
+        if not kept:
+            return None
+        if len(kept) == len(event.calls):
+            return event
+        return ToolCallsEvent(calls=kept)
+
+    if isinstance(event, ToolResultsEvent):
+        kept = [r for r in event.results if r.name not in ignore_tool_names]
+        if not kept:
+            return None
+        if len(kept) == len(event.results):
+            return event
+        return ToolResultsEvent(results=kept)
+
+    return event
+
+
+def _prune_l1_ignored_tools_from_head_and_rejoin(
+    raw: list[BaseEvent],
+    protected_index: int,
+    *,
+    ignore_tool_names: frozenset[str],
+) -> tuple[list[BaseEvent], int]:
+    """Prune ignored-tool events from ``raw[:protected_index]`` only; keep suffix verbatim.
+
+    Returns ``(new_raw, cutoff)`` where *cutoff* is the start index of the
+    preserved suffix in *new_raw* (``len(pruned_head)``), suitable for L1
+    compression of ``new_raw[:cutoff]``.
+    """
+    if protected_index <= 0:
+        return raw, 0
+    head, tail = raw[:protected_index], raw[protected_index:]
+    if not ignore_tool_names:
+        return head + tail, len(head)
+    stripped: list[BaseEvent] = []
+    for ev in head:
+        pruned = _prune_l1_ignored_tools_from_event(ev, ignore_tool_names=ignore_tool_names)
+        if pruned is not None:
+            stripped.append(pruned)
+    return stripped + tail, len(stripped)
+
+
 def _char_token_estimate(text: str) -> int:
     """Rough token estimate: 1 token ≈ 4 characters."""
     return len(text) // 4
 
 
-def _events_to_text(events: Iterable[BaseEvent]) -> str:
-    """Render a sequence of events as a human-readable conversation transcript."""
+def _events_to_text(
+    events: Iterable[BaseEvent],
+    *,
+    ignore_tool_names: frozenset[str] = frozenset(),
+) -> str:
+    """Render events as a transcript for L1 sizing and summarisation.
+
+    Lines for tools whose names appear in *ignore_tool_names* are omitted so
+    bulky ``memory_lookup`` payloads do not inflate the L1 token budget or
+    get embedded in new L1 ``source_text``.
+    """
     lines: list[str] = []
     for event in events:
         if isinstance(event, ModelRequest):
@@ -1022,8 +1178,14 @@ def _events_to_text(events: Iterable[BaseEvent]) -> str:
                 lines.append(f"Assistant: {event.message.content}")
             if event.tool_calls:
                 for call in event.tool_calls.calls:
+                    if call.name not in ignore_tool_names:
+                        lines.append(f"Assistant calls tool '{call.name}': {call.arguments}")
+        elif isinstance(event, ToolCallsEvent):
+            for call in event.calls:
+                if call.name not in ignore_tool_names:
                     lines.append(f"Assistant calls tool '{call.name}': {call.arguments}")
         elif isinstance(event, ToolResultsEvent):
             for r in event.results:
-                lines.append(f"Tool result: {r.content}")
+                if r.name not in ignore_tool_names:
+                    lines.append(f"Tool result: {r.content}")
     return "\n".join(lines)
