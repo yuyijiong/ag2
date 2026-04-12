@@ -1,8 +1,6 @@
-# Copyright (c) 2023 - 2026, AG2ai, Inc., AG2ai open-source projects maintainers and core contributors
+# Copyright (c) 2026, AG2ai, Inc., AG2ai open-source projects maintainers and core contributors
 #
 # SPDX-License-Identifier: Apache-2.0
-
-from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Sequence
@@ -19,7 +17,7 @@ from anthropic.types import (
 )
 
 from autogen.beta.config.client import LLMClient
-from autogen.beta.context import Context
+from autogen.beta.context import ConversationContext
 from autogen.beta.events import (
     BaseEvent,
     ModelMessage,
@@ -32,7 +30,13 @@ from autogen.beta.events import (
 from autogen.beta.response import ResponseProto
 from autogen.beta.tools.schemas import ToolSchema
 
-from .mappers import convert_messages, normalize_usage, response_proto_to_output_config, tool_to_api
+from .mappers import (
+    convert_messages,
+    extract_mcp_servers,
+    normalize_usage,
+    response_proto_to_output_config,
+    tool_to_api,
+)
 
 
 class CreateOptions(TypedDict, total=False):
@@ -58,8 +62,6 @@ class AnthropicClient(LLMClient):
         http_client: httpx.AsyncClient | None = None,
         create_options: CreateOptions | None = None,
         prompt_caching: bool = True,
-        web_search_version: str = "web_search_20250305",
-        web_fetch_version: str = "web_fetch_20250910",
     ) -> None:
         self._client = AsyncAnthropic(
             api_key=api_key,
@@ -73,13 +75,11 @@ class AnthropicClient(LLMClient):
         self._create_options = {k: v for k, v in (create_options or {}).items() if k != "stream"}
         self._streaming = (create_options or {}).get("stream", False)
         self._prompt_caching = prompt_caching
-        self._web_search_version = web_search_version
-        self._web_fetch_version = web_fetch_version
 
     async def __call__(
         self,
         messages: Sequence[BaseEvent],
-        context: Context,
+        context: "ConversationContext",
         *,
         tools: Iterable[ToolSchema],
         response_schema: ResponseProto | None,
@@ -100,10 +100,9 @@ class AnthropicClient(LLMClient):
         if self._prompt_caching and anthropic_messages:
             self._inject_cache_control(anthropic_messages)
 
-        tools_list = [
-            tool_to_api(t, web_search_version=self._web_search_version, web_fetch_version=self._web_fetch_version)
-            for t in tools
-        ]
+        tools_schemas = list(tools)
+        tools_list = [tool_to_api(t) for t in tools_schemas]
+        mcp_servers = extract_mcp_servers(tools_schemas)
 
         kwargs: dict[str, Any] = {}
         if r := response_proto_to_output_config(response_schema):
@@ -116,6 +115,10 @@ class AnthropicClient(LLMClient):
             "messages": anthropic_messages,
             "tools": tools_list if tools_list else NOT_GIVEN,
         }
+
+        if mcp_servers:
+            create_kwargs["extra_headers"] = {"anthropic-beta": "mcp-client-2025-11-20"}
+            create_kwargs["extra_body"] = {"mcp_servers": mcp_servers}
 
         max_continuations = 5
 
@@ -166,7 +169,7 @@ class AnthropicClient(LLMClient):
     async def _process_response(
         self,
         response: Message,
-        context: Context,
+        context: "ConversationContext",
     ) -> ModelResponse:
         text_parts: list[str] = []
         calls: list[ToolCallEvent] = []
@@ -174,7 +177,7 @@ class AnthropicClient(LLMClient):
         for block in response.content:
             if isinstance(block, ThinkingBlock):
                 if block.thinking:
-                    await context.send(ModelReasoning(content=block.thinking))
+                    await context.send(ModelReasoning(block.thinking))
 
             elif isinstance(block, TextBlock):
                 text_parts.append(block.text)
@@ -190,14 +193,14 @@ class AnthropicClient(LLMClient):
 
         model_msg: ModelMessage | None = None
         if text_parts:
-            model_msg = ModelMessage(content="\n\n".join(text_parts))
+            model_msg = ModelMessage("\n\n".join(text_parts))
             await context.send(model_msg)
 
         usage = normalize_usage(response.usage.model_dump() if response.usage else {})
 
         return ModelResponse(
             message=model_msg,
-            tool_calls=ToolCallsEvent(calls=calls),
+            tool_calls=ToolCallsEvent(calls),
             usage=usage,
             model=response.model,
             provider="anthropic",
@@ -207,7 +210,7 @@ class AnthropicClient(LLMClient):
     async def _process_stream(
         self,
         stream: Any,
-        context: Context,
+        context: "ConversationContext",
     ) -> ModelResponse:
         full_content: str = ""
         calls: list[ToolCallEvent] = []
@@ -232,10 +235,10 @@ class AnthropicClient(LLMClient):
 
                 if delta_type == "text_delta":
                     full_content += delta.text
-                    await context.send(ModelMessageChunk(content=delta.text))
+                    await context.send(ModelMessageChunk(delta.text))
 
                 elif delta_type == "thinking_delta":
-                    await context.send(ModelReasoning(content=delta.thinking))
+                    await context.send(ModelReasoning(delta.thinking))
 
                 elif delta_type == "input_json_delta" and current_tool is not None:
                     current_tool["arguments"] += delta.partial_json
@@ -253,14 +256,14 @@ class AnthropicClient(LLMClient):
 
         message: ModelMessage | None = None
         if full_content:
-            message = ModelMessage(content=full_content)
+            message = ModelMessage(full_content)
             await context.send(message)
 
         final_message = await stream.get_final_message()
         # Mapped to our usage keys
         return ModelResponse(
             message=message,
-            tool_calls=ToolCallsEvent(calls=calls),
+            tool_calls=ToolCallsEvent(calls),
             usage=normalize_usage(final_message.usage.model_dump() if final_message.usage else {}),
             model=final_message.model,
             provider="anthropic",
