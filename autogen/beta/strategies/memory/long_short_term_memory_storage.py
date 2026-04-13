@@ -13,9 +13,11 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from .annotations import Context
-from .context import StreamId
-from .events import (
+import tiktoken
+
+from ...annotations import Context
+from ...context import StreamId
+from ...events import (
     BaseEvent,
     ModelRequest,
     ModelResponse,
@@ -230,7 +232,7 @@ Return ONLY a JSON array of operations, for example:
 def _build_default_summarizer(config: Any) -> "Summarizer":
     """Return a summarizer backed by *config* using the default prompt."""
     async def _summarizer(text: str) -> str:
-        from .agent import Agent  # local import to avoid circular dependency
+        from ...agent import Agent  # local import to avoid circular dependency
         agent = Agent("summariser", prompt=_DEFAULT_SUMMARIZER_SYSTEM, config=config)
         reply = await agent.ask(
             _DEFAULT_SUMMARIZER_USER.format(
@@ -285,7 +287,7 @@ def _build_default_core_consolidator(config: Any) -> "CoreConsolidator":
             current_content=current_content,
             new_l1_text=new_l1_text,
         )
-        from .agent import Agent  # local import to avoid circular dependency
+        from ...agent import Agent  # local import to avoid circular dependency
         agent = Agent("core-memory-manager", prompt=_DEFAULT_CORE_MEMORY_SYSTEM, config=config)
         reply = await agent.ask(prompt)
         return (await reply.content()) or current_content
@@ -318,7 +320,7 @@ def _build_default_consolidator(config: Any) -> "Consolidator":
             new_l1_text=new_l1_text,
         )
 
-        from .agent import Agent  # local import to avoid circular dependency
+        from ...agent import Agent  # local import to avoid circular dependency
         agent = Agent("memory-manager", prompt=_DEFAULT_CONSOLIDATOR_SYSTEM, config=config)
         reply = await agent.ask(prompt)
         raw = (await reply.content()) or "[]"
@@ -380,7 +382,7 @@ class LongShortTermMemoryStorage:
     **Minimal usage** — pass only a model *config* and a store path::
 
         from autogen.beta.config.openai.config import OpenAIConfig
-        from autogen.beta.long_short_term_memory_storage import LongShortTermMemoryStorage
+        from autogen.beta.history import LongShortTermMemoryStorage
 
         config = OpenAIConfig(model="gpt-4o-mini", api_key="sk-...")
         storage = LongShortTermMemoryStorage(
@@ -468,8 +470,10 @@ class LongShortTermMemoryStorage:
             every successful ``consolidate()`` call.  Pass ``None`` to keep
             all memory in-process only.
         token_counter:
-            Optional callable ``(text: str) -> int``.  Defaults to a simple
-            character-based heuristic (1 token ≈ 4 characters).
+            Optional callable ``(text: str) -> int``.  Defaults to counting
+            tokens with ``tiktoken`` using the ``gpt-4o`` model encoding
+            (``o200k_base``).  Pass :func:`_char_token_estimate` to restore the
+            previous character-based heuristic (1 token ≈ 4 characters).
         token_threshold:
             Raw-event token budget that triggers L1 compression (default 10 000).
         max_l2_blocks:
@@ -508,7 +512,7 @@ class LongShortTermMemoryStorage:
             self._core_consolidator = self._default_core_consolidator
 
         self._l2_store_path = Path(l2_store_path) if l2_store_path else None
-        self._token_counter = token_counter or _char_token_estimate
+        self._token_counter = token_counter or _gpt4o_token_count
         self._token_threshold = token_threshold
         self._max_l2_blocks = max_l2_blocks
         self._recent_turns = recent_turns
@@ -1151,6 +1155,17 @@ def _prune_l1_ignored_tools_from_head_and_rejoin(
         if pruned is not None:
             stripped.append(pruned)
     return stripped + tail, len(stripped)
+
+
+_gpt4o_encoding: tiktoken.Encoding | None = None
+
+
+def _gpt4o_token_count(text: str) -> int:
+    """Count tokens using tiktoken's encoding for ``gpt-4o`` (``o200k_base``)."""
+    global _gpt4o_encoding
+    if _gpt4o_encoding is None:
+        _gpt4o_encoding = tiktoken.encoding_for_model("gpt-4o")
+    return len(_gpt4o_encoding.encode(text))
 
 
 def _char_token_estimate(text: str) -> int:

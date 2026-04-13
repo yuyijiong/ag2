@@ -222,8 +222,8 @@ async def run_session(task: str, follow_ups: list[str] | None = None) -> None:
 
     # Consolidation has run; show what changed.
     print_memory_state("Memory state AFTER this session")
-    if storage._l2_blocks:
-        print(f"  → Saved to: {L2_STORE}")
+    if storage._l2_blocks and storage._l2_store_path:
+        print(f"  → Saved to: {storage._l2_store_path}")
 
 
 # ---------------------------------------------------------------------------

@@ -11,7 +11,7 @@ from .context import StreamId
 from .events import BaseEvent
 
 # Long / short-term memory (re-exported here for backward compatibility)
-from .long_short_term_memory_storage import (
+from .strategies.memory import (
     Consolidator,
     CoreConsolidator,
     CoreMemoryBlock,
