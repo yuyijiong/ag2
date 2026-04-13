@@ -1,15 +1,37 @@
-# Copyright (c) 2023 - 2026, AG2ai, Inc., AG2ai open-source projects maintainers and core contributors
+# Copyright (c) 2026, AG2ai, Inc., AG2ai open-source projects maintainers and core contributors
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import base64
 from collections.abc import Iterable, Sequence
 from typing import Any
 
-from autogen.beta.events import BaseEvent, ModelRequest, ModelResponse, ToolResultsEvent
-from autogen.beta.exceptions import UnsupportedToolError
+from openai.types import CompletionUsage
+from openai.types.responses import ResponseUsage
+
+from autogen.beta.events import (
+    BaseEvent,
+    BinaryInput,
+    BinaryType,
+    DocumentUrlInput,
+    FileIdInput,
+    ImageUrlInput,
+    ModelRequest,
+    ModelResponse,
+    TextInput,
+    ToolResultsEvent,
+)
+from autogen.beta.events.types import Usage
+from autogen.beta.exceptions import UnsupportedInputError, UnsupportedToolError
 from autogen.beta.response import ResponseProto
 from autogen.beta.tools.builtin.code_execution import CodeExecutionToolSchema
 from autogen.beta.tools.builtin.image_generation import ImageGenerationToolSchema
+from autogen.beta.tools.builtin.mcp_server import MCPServerToolSchema
+from autogen.beta.tools.builtin.shell import (
+    ContainerAutoEnvironment,
+    ContainerReferenceEnvironment,
+    ShellToolSchema,
+)
 from autogen.beta.tools.builtin.web_search import WebSearchToolSchema
 from autogen.beta.tools.final import FunctionToolSchema
 from autogen.beta.tools.schemas import ToolSchema
@@ -65,7 +87,9 @@ def _ensure_additional_properties_false(schema: dict[str, Any]) -> dict[str, Any
     return schema
 
 
-def response_proto_to_text_config(response: ResponseProto | None) -> dict[str, Any] | None:
+def response_proto_to_text_config(
+    response: ResponseProto | None,
+) -> dict[str, Any] | None:
     """Convert a ResponseProto to Responses API text config."""
     if not response or not response.json_schema:
         return
@@ -90,10 +114,36 @@ def events_to_responses_input(messages: Sequence[BaseEvent]) -> list[dict[str, A
 
     for message in messages:
         if isinstance(message, ModelRequest):
-            result.append({
-                "role": "user",
-                "content": [{"type": "input_text", "text": message.content}],
-            })
+            for inp in message.inputs:
+                if isinstance(inp, TextInput):
+                    result.append({"role": "user", "content": [{"type": "input_text", "text": inp.content}]})
+
+                elif isinstance(inp, ImageUrlInput):
+                    result.append({"role": "user", "content": [{"type": "input_image", "image_url": inp.url}]})
+
+                elif isinstance(inp, DocumentUrlInput):
+                    result.append({"role": "user", "content": [{"type": "input_file", "file_url": inp.url}]})
+
+                elif isinstance(inp, FileIdInput):
+                    item: dict[str, Any] = {"type": "input_file", "file_id": inp.file_id}
+                    if inp.filename is not None:
+                        item["filename"] = inp.filename
+                    result.append({
+                        "role": "user",
+                        "content": [item],
+                    })
+
+                elif isinstance(inp, BinaryInput):
+                    b64 = base64.b64encode(inp.data).decode()
+                    item: dict[str, Any] = {
+                        "type": "input_file",
+                        "file_data": f"data:{inp.media_type};base64,{b64}",
+                        **inp.vendor_metadata,
+                    }
+                    result.append({"role": "user", "content": [item]})
+
+                else:
+                    raise UnsupportedInputError(type(inp).__name__, "openai-responses")
 
         elif isinstance(message, ModelResponse):
             # Reconstruct assistant message
@@ -133,8 +183,37 @@ def convert_messages(
     result: list[dict[str, str]] = [{"content": "\n".join(system_prompt), "role": "system"}]
 
     for message in messages:
-        if isinstance(message, (ModelRequest, ModelResponse)):
+        if isinstance(message, ModelRequest):
+            for inp in message.inputs:
+                if isinstance(inp, TextInput):
+                    result.append(inp.to_api())
+
+                if isinstance(inp, ImageUrlInput):
+                    result.append({
+                        "role": "user",
+                        "content": [{"type": "image_url", "image_url": {"url": inp.url}}],
+                    })
+
+                elif isinstance(inp, BinaryInput):
+                    if inp.kind == BinaryType.AUDIO:
+                        b64 = base64.b64encode(inp.data).decode()
+                        fmt = _MIME_TO_AUDIO_FORMAT.get(inp.media_type, inp.media_type.split("/", 1)[1])
+                        item: dict[str, Any] = {"type": "input_audio", "input_audio": {"data": b64, "format": fmt}}
+                    elif inp.kind == BinaryType.IMAGE:
+                        b64 = base64.b64encode(inp.data).decode()
+                        data_url = f"data:{inp.media_type};base64,{b64}"
+                        item = {"type": "image_url", "image_url": {"url": data_url}, **inp.vendor_metadata}
+                    else:
+                        raise UnsupportedInputError(type(inp).__name__, "openai-completions")
+
+                    result.append({"role": "user", "content": [item]})
+
+                else:
+                    raise UnsupportedInputError(type(inp).__name__, "openai-completions")
+
+        elif isinstance(message, ModelResponse):
             result.append(message.to_api())
+
         elif isinstance(message, ToolResultsEvent):
             for r in message.results:
                 result.append(r.to_api())
@@ -162,9 +241,6 @@ def tool_to_api(t: ToolSchema) -> dict[str, Any]:
                 "parameters": _ensure_object_schema(t.function.parameters),
             },
         }
-
-    if isinstance(t, ImageGenerationToolSchema):
-        raise UnsupportedToolError(t.type, "openai-completions")
 
     raise UnsupportedToolError(t.type, "openai-completions")
 
@@ -201,8 +277,30 @@ def tool_to_responses_api(t: ToolSchema) -> dict[str, Any]:
         return result
 
     elif isinstance(t, CodeExecutionToolSchema):
-        # https://platform.openai.com/docs/api-reference/responses/create#responses-create-tools
+        # https://developers.openai.com/api/docs/guides/tools-code-interpreter
         return {"type": "code_interpreter", "container": {"type": "auto"}}
+
+    elif isinstance(t, ShellToolSchema):
+        # https://developers.openai.com/api/docs/guides/tools-shell
+        result_shell: dict[str, Any] = {"type": "shell"}
+        if t.environment is not None:
+            env: dict[str, Any]
+            if isinstance(t.environment, ContainerAutoEnvironment):
+                env = {"type": "container_auto"}
+                if t.environment.network_policy is not None:
+                    env["network_policy"] = {
+                        "type": "allowlist",
+                        "allowed_domains": t.environment.network_policy.allowed_domains,
+                    }
+            elif isinstance(t.environment, ContainerReferenceEnvironment):
+                env = {
+                    "type": "container_reference",
+                    "container_id": t.environment.container_id,
+                }
+            else:
+                env = {"type": "local"}
+            result_shell["environment"] = env
+        return result_shell
 
     elif isinstance(t, ImageGenerationToolSchema):
         result: dict[str, Any] = {"type": "image_generation"}
@@ -220,26 +318,54 @@ def tool_to_responses_api(t: ToolSchema) -> dict[str, Any]:
             result["partial_images"] = t.partial_images
         return result
 
+    elif isinstance(t, MCPServerToolSchema):
+        # https://platform.openai.com/docs/guides/tools-remote-mcp
+        result = {
+            "type": "mcp",
+            "server_label": t.server_label,
+            "server_url": t.server_url,
+            "require_approval": "never",
+        }
+        if t.description is not None:
+            result["server_description"] = t.description
+        if t.allowed_tools is not None:
+            result["allowed_tools"] = t.allowed_tools
+        if t.headers is not None:
+            result["headers"] = t.headers
+        elif t.authorization_token is not None:
+            result["headers"] = {"Authorization": f"Bearer {t.authorization_token}"}
+        return result
+
     raise UnsupportedToolError(t.type, "openai-responses")
 
 
-def normalize_usage(usage: dict[str, Any]) -> dict[str, Any]:
-    """Lift OpenAI's nested cache token counts to top-level keys."""
-    details = usage.get("prompt_tokens_details") or {}
-    cached = details.get("cached_tokens")
-    if cached:
-        usage["cache_read_input_tokens"] = cached
-    return usage
+def normalize_usage(usage: CompletionUsage) -> Usage:
+    return Usage(
+        prompt_tokens=usage.prompt_tokens,
+        completion_tokens=usage.completion_tokens,
+        total_tokens=usage.total_tokens,
+        cache_read_input_tokens=usage.prompt_tokens_details.cached_tokens if usage.prompt_tokens_details else None,
+        cache_creation_input_tokens=usage.completion_tokens_details.reasoning_tokens
+        if usage.completion_tokens_details
+        else None,
+    )
 
 
-def normalize_responses_usage(usage: dict[str, Any]) -> dict[str, Any]:
-    """Normalize Responses API usage keys and lift nested cache tokens."""
-    if "input_tokens" in usage and "prompt_tokens" not in usage:
-        usage["prompt_tokens"] = usage["input_tokens"]
-    if "output_tokens" in usage and "completion_tokens" not in usage:
-        usage["completion_tokens"] = usage["output_tokens"]
-    details = usage.get("input_tokens_details") or {}
-    cached = details.get("cached_tokens")
-    if cached:
-        usage["cache_read_input_tokens"] = cached
-    return usage
+def normalize_responses_usage(usage: ResponseUsage) -> Usage:
+    return Usage(
+        prompt_tokens=usage.input_tokens,
+        completion_tokens=usage.output_tokens,
+        total_tokens=usage.total_tokens,
+        cache_read_input_tokens=usage.input_tokens_details.cached_tokens,
+        cache_creation_input_tokens=usage.output_tokens_details.reasoning_tokens,
+    )
+
+
+_MIME_TO_AUDIO_FORMAT: dict[str, str] = {
+    "audio/wav": "wav",
+    "audio/mpeg": "mp3",
+    "audio/ogg": "ogg",
+    "audio/flac": "flac",
+    "audio/aiff": "aiff",
+    "audio/aac": "aac",
+}
