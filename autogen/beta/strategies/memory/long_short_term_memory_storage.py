@@ -18,11 +18,18 @@ import tiktoken
 from ...annotations import Context
 from ...context import StreamId
 from ...events import (
+    AudioUrlInput,
     BaseEvent,
+    BinaryInput,
+    DocumentUrlInput,
+    FileIdInput,
+    ImageUrlInput,
     ModelRequest,
     ModelResponse,
+    TextInput,
     ToolCallsEvent,
     ToolResultsEvent,
+    VideoUrlInput,
 )
 
 logger = logging.getLogger(__name__)
@@ -171,7 +178,7 @@ def parse_l2_operation(d: dict) -> L2Operation:
 # ---------------------------------------------------------------------------
 
 # Soft upper bound (word count) communicated to the default LLM prompts for L1/L2 abstracts.
-_DEFAULT_MEMORY_ABSTRACT_MAX_WORDS = 1000
+_DEFAULT_MEMORY_ABSTRACT_MAX_WORDS = 500
 
 _DEFAULT_SUMMARIZER_SYSTEM = (
     "You are a summariser for a memory index. Reply with only the summary, no preamble. "
@@ -183,8 +190,8 @@ _DEFAULT_SUMMARIZER_SYSTEM = (
 _DEFAULT_SUMMARIZER_USER = (
     "Summarise the following. You may use one paragraph or several; keep the total under "
     "{max_words} words. Preserve retrieval-critical specifics from the "
-    "source whenever they appear: people’s names and roles; organisation, product, and place "
-    "names; dates, times, time zones, and deadlines; numbers, versions, IDs, URLs, and file "
+    "source including but not limited to: people’s names and roles; organisation, product, and place "
+    "names; dates, times, time zones; numbers, versions, IDs, URLs, and file "
     "paths; explicit decisions, outcomes, and open questions. Prefer named entities over vague "
     "phrases like “the user” or “a meeting” when a proper noun or time is known. Do not strip "
     "information the agent would need to decide whether to call memory_lookup for this block.\n\n"
@@ -980,7 +987,7 @@ class LongShortTermMemoryStorage:
             for block in l1:
                 lines.append(f"  [{block.id}] (created {block.created_at}) {block.abstract}")
 
-        return ModelRequest(content="\n".join(lines))
+        return ModelRequest.ensure_request(["\n".join(lines)])
 
     # ------------------------------------------------------------------
     # JSON persistence for L1 + L2 blocks
@@ -1173,6 +1180,24 @@ def _char_token_estimate(text: str) -> int:
     return len(text) // 4
 
 
+def _model_request_inputs_to_user_text(request: ModelRequest) -> str:
+    """Flatten ``ModelRequest.inputs`` to plain text for L1 transcript sizing."""
+    chunks: list[str] = []
+    for inp in request.inputs:
+        if isinstance(inp, TextInput):
+            chunks.append(inp.content)
+        elif isinstance(inp, (ImageUrlInput, AudioUrlInput, DocumentUrlInput, VideoUrlInput)):
+            chunks.append(f"[{type(inp).__name__}: {inp.url}]")
+        elif isinstance(inp, FileIdInput):
+            fn = f" ({inp.filename})" if inp.filename else ""
+            chunks.append(f"[file_id: {inp.file_id}{fn}]")
+        elif isinstance(inp, BinaryInput):
+            chunks.append(f"[binary {inp.kind}: {inp.media_type}, {len(inp.data)} bytes]")
+        else:
+            chunks.append(f"[{type(inp).__name__}]")
+    return "\n".join(chunks)
+
+
 def _events_to_text(
     events: Iterable[BaseEvent],
     *,
@@ -1187,7 +1212,7 @@ def _events_to_text(
     lines: list[str] = []
     for event in events:
         if isinstance(event, ModelRequest):
-            lines.append(f"User: {event.content}")
+            lines.append(f"User: {_model_request_inputs_to_user_text(event)}")
         elif isinstance(event, ModelResponse):
             if event.message:
                 lines.append(f"Assistant: {event.message.content}")

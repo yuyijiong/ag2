@@ -187,13 +187,11 @@ def convert_messages(
             for inp in message.inputs:
                 if isinstance(inp, TextInput):
                     result.append(inp.to_api())
-
-                if isinstance(inp, ImageUrlInput):
+                elif isinstance(inp, ImageUrlInput):
                     result.append({
                         "role": "user",
                         "content": [{"type": "image_url", "image_url": {"url": inp.url}}],
                     })
-
                 elif isinstance(inp, BinaryInput):
                     if inp.kind == BinaryType.AUDIO:
                         b64 = base64.b64encode(inp.data).decode()

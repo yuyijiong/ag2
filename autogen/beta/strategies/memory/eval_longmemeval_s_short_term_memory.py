@@ -252,7 +252,7 @@ async def inject_haystack(
             if role == "user":
                 if prefix_session_dates:
                     content = f"[Session date: {session_date}]\n{content}"
-                await storage.save_event(ModelRequest(content=content), ctx)
+                await storage.save_event(ModelRequest.ensure_request([content]), ctx)
                 await storage.get_history(sid)
             elif role == "assistant":
                 await storage.save_event(
@@ -336,10 +336,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--data",
         type=Path,
-        default=_REPO_ROOT / "LongMemEval" / "data" / "longmemeval_s_cleaned_100.json",
+        default=_REPO_ROOT / "LongMemEval" / "data" / "longmemeval_s_cleaned.json",
         help="Path to longmemeval_s_cleaned.json",
     )
-    p.add_argument("--out", type=Path, default="./longmemeval_s_LSTMS.jsonl", help="Output JSONL path (one object per line)")
+    p.add_argument("--out", type=Path, default="./longmemeval_s_result_LSTMS.jsonl", help="Output JSONL path (one object per line)")
     p.add_argument("--model", type=str, default="gpt-5-mini", help="OpenAI model id for the agent")
     p.add_argument("--api_key", type=str, default=os.environ.get("OPENAI_API_KEY"), help="OpenAI API key")
     p.add_argument(
