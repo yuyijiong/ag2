@@ -641,10 +641,6 @@
          <lastmod>2026-04-14</lastmod>
     </url>
     <url>
-         <loc>https://docs.ag2.ai/latest/docs/api-reference/autogen/beta/agent/Plugin/</loc>
-         <lastmod>2026-04-14</lastmod>
-    </url>
-    <url>
          <loc>https://docs.ag2.ai/latest/docs/api-reference/autogen/beta/annotations/Inject/</loc>
          <lastmod>2026-04-14</lastmod>
     </url>
@@ -1017,14 +1013,6 @@
          <lastmod>2026-04-14</lastmod>
     </url>
     <url>
-         <loc>https://docs.ag2.ai/latest/docs/api-reference/autogen/beta/tools/builtin/skills/Skill/</loc>
-         <lastmod>2026-04-14</lastmod>
-    </url>
-    <url>
-         <loc>https://docs.ag2.ai/latest/docs/api-reference/autogen/beta/tools/builtin/skills/SkillsTool/</loc>
-         <lastmod>2026-04-14</lastmod>
-    </url>
-    <url>
          <loc>https://docs.ag2.ai/latest/docs/api-reference/autogen/beta/tools/builtin/web_fetch/WebFetchTool/</loc>
          <lastmod>2026-04-14</lastmod>
     </url>
@@ -1061,6 +1049,10 @@
          <lastmod>2026-04-14</lastmod>
     </url>
     <url>
+         <loc>https://docs.ag2.ai/latest/docs/api-reference/autogen/beta/tools/schemas/ToolSchema/</loc>
+         <lastmod>2026-04-14</lastmod>
+    </url>
+    <url>
          <loc>https://docs.ag2.ai/latest/docs/api-reference/autogen/beta/tools/shell/environment/base/ShellEnvironment/</loc>
          <lastmod>2026-04-14</lastmod>
     </url>
@@ -1085,27 +1077,7 @@
          <lastmod>2026-04-14</lastmod>
     </url>
     <url>
-         <loc>https://docs.ag2.ai/latest/docs/api-reference/autogen/beta/tools/toolkits/filesystem/FilesystemToolkit/</loc>
-         <lastmod>2026-04-14</lastmod>
-    </url>
-    <url>
-         <loc>https://docs.ag2.ai/latest/docs/api-reference/autogen/beta/tools/toolkits/skills/local_skills/toolkit/SkillsToolkit/</loc>
-         <lastmod>2026-04-14</lastmod>
-    </url>
-    <url>
-         <loc>https://docs.ag2.ai/latest/docs/api-reference/autogen/beta/tools/toolkits/skills/runtime/local/LocalRuntime/</loc>
-         <lastmod>2026-04-14</lastmod>
-    </url>
-    <url>
-         <loc>https://docs.ag2.ai/latest/docs/api-reference/autogen/beta/tools/toolkits/skills/runtime/protocol/SkillRuntime/</loc>
-         <lastmod>2026-04-14</lastmod>
-    </url>
-    <url>
-         <loc>https://docs.ag2.ai/latest/docs/api-reference/autogen/beta/tools/toolkits/skills/skill_search/config/SkillsClientConfig/</loc>
-         <lastmod>2026-04-14</lastmod>
-    </url>
-    <url>
-         <loc>https://docs.ag2.ai/latest/docs/api-reference/autogen/beta/tools/toolkits/skills/skill_search/toolkit/SkillSearchToolkit/</loc>
+         <loc>https://docs.ag2.ai/latest/docs/api-reference/autogen/beta/tools/toolkits/filesystem/FilesystemToolset/</loc>
          <lastmod>2026-04-14</lastmod>
     </url>
     <url>
@@ -2121,6 +2093,10 @@
          <lastmod>2026-04-14</lastmod>
     </url>
     <url>
+         <loc>https://docs.ag2.ai/latest/docs/beta/memory/</loc>
+         <lastmod>2026-04-14</lastmod>
+    </url>
+    <url>
          <loc>https://docs.ag2.ai/latest/docs/beta/middleware/</loc>
          <lastmod>2026-04-14</lastmod>
     </url>
@@ -2177,10 +2153,6 @@
          <lastmod>2026-04-14</lastmod>
     </url>
     <url>
-         <loc>https://docs.ag2.ai/latest/docs/beta/inputs/inputs/</loc>
-         <lastmod>2026-04-14</lastmod>
-    </url>
-    <url>
          <loc>https://docs.ag2.ai/latest/docs/beta/tools/approval_required/</loc>
          <lastmod>2026-04-14</lastmod>
     </url>
@@ -2189,7 +2161,7 @@
          <lastmod>2026-04-14</lastmod>
     </url>
     <url>
-         <loc>https://docs.ag2.ai/latest/docs/beta/tools/common_toolkits/</loc>
+         <loc>https://docs.ag2.ai/latest/docs/beta/tools/common_toolsets/</loc>
          <lastmod>2026-04-14</lastmod>
     </url>
     <url>
