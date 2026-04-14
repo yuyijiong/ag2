@@ -2,6 +2,11 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from .filesystem import FilesystemToolset
+from .filesystem import FilesystemToolkit
+from .skills import SkillSearchToolkit, SkillsToolkit
 
-__all__ = ("FilesystemToolset",)
+__all__ = (
+    "FilesystemToolkit",
+    "SkillSearchToolkit",
+    "SkillsToolkit",
+)
